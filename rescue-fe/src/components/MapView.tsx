@@ -10,11 +10,19 @@ const DEFAULT_CENTER = { lat: 21.0285, lng: 105.8542 };
 const ICON_RED = "https://maps.google.com/mapfiles/ms/icons/red-dot.png";
 const ICON_BLUE = "https://maps.google.com/mapfiles/ms/icons/blue-dot.png";
 
-// Lấy Token
+// Token ORS
 const ORS_TOKEN = import.meta.env.VITE_ORS_TOKEN;
 const REFRESH_DISTANCE = 10; // 10 mét vẽ lại đường
 
 type Role = "PATIENT" | "RESCUER";
+
+// Kiểu dữ liệu User đồng bộ với Backend mới
+type UserLocation = {
+    connectionId: string;
+    role: string; // "PATIENT" | "RESCUER"
+    lat: number;
+    lng: number;
+};
 
 // --- HELPER FUNCTIONS ---
 const formatRouteInfo = (meters: number, seconds: number) => {
@@ -23,6 +31,7 @@ const formatRouteInfo = (meters: number, seconds: number) => {
     return { distance: distanceStr, duration: durationStr };
 };
 
+// Tính khoảng cách giữa 2 điểm
 const getDistanceInMeters = (lat1: number, lng1: number, lat2: number, lng2: number) => {
   const R = 6371e3; 
   const φ1 = (lat1 * Math.PI) / 180;
@@ -36,10 +45,18 @@ const getDistanceInMeters = (lat1: number, lng1: number, lat2: number, lng2: num
 
 export default function MapView() {
   const [myPos, setMyPos] = useState(DEFAULT_CENTER);
-  const [otherPos, setOtherPos] = useState<{ lat: number; lng: number } | null>(null);
+  
+  // 🔥 STATE LƯU DANH SÁCH NHIỀU USER (Dictionary: ID -> User)
+  const [otherUsers, setOtherUsers] = useState<Record<string, UserLocation>>({});
+  
+  // State xác định mục tiêu gần nhất để vẽ đường
+  const [targetUser, setTargetUser] = useState<UserLocation | null>(null);
+
   const [role, setRole] = useState<Role>("PATIENT");
   const [gpsStarted, setGpsStarted] = useState(false);
   const [showRecenterBtn, setShowRecenterBtn] = useState(false);
+
+  // Info đường đi & Path
   const [routeInfo, setRouteInfo] = useState<{ distance: string; duration: string } | null>(null);
   const [routePath, setRoutePath] = useState<{lat: number, lng: number}[]>([]);
 
@@ -50,32 +67,56 @@ export default function MapView() {
   const lastApiCall = useRef<number>(0);
   const lastRouteFetchPos = useRef<{ lat: number, lng: number } | null>(null);
   const isAutoCenterRef = useRef(true); 
-  
-  // 🔥 Ref lưu Role để SignalR luôn biết role hiện tại là gì mà không cần reconnect
-  const roleRef = useRef<Role>("PATIENT");
+  const roleRef = useRef<Role>("PATIENT"); // Để SignalR đọc role không cần reconnect
 
   const { isLoaded, loadError } = useJsApiLoader({
     googleMapsApiKey: import.meta.env.VITE_GOOGLE_MAPS_KEY,
   });
 
-  // Cập nhật Role Ref khi state đổi
+  // Cập nhật Role Ref
   useEffect(() => {
     roleRef.current = role;
-    // Khi đổi role, reset vị trí đối phương để tránh nhầm lẫn
-    setOtherPos(null);
+    // Khi đổi role, reset các state liên quan
+    setOtherUsers({});
+    setTargetUser(null);
     setRoutePath([]);
     setRouteInfo(null);
   }, [role]);
 
-  // --- 1. GỌI API CHỈ ĐƯỜNG ---
+  // --- 1. TÌM MỤC TIÊU GẦN NHẤT ---
+  // Mỗi khi myPos hoặc danh sách otherUsers thay đổi, tìm người gần nhất có Role đối lập
+  useEffect(() => {
+    if (!gpsStarted) return;
+
+    let minDist = Infinity;
+    let closestUser: UserLocation | null = null;
+    const oppositeRole = role === "PATIENT" ? "RESCUER" : "PATIENT";
+
+    Object.values(otherUsers).forEach(user => {
+        if (user.role === oppositeRole) {
+            const dist = getDistanceInMeters(myPos.lat, myPos.lng, user.lat, user.lng);
+            if (dist < minDist) {
+                minDist = dist;
+                closestUser = user;
+            }
+        }
+    });
+
+    setTargetUser(closestUser);
+  }, [myPos, otherUsers, role, gpsStarted]);
+
+
+  // --- 2. GỌI API CHỈ ĐƯỜNG (Tới TargetUser) ---
   const fetchORSDirections = useCallback(async (start: { lat: number; lng: number }, end: { lat: number; lng: number }) => {
     if (!ORS_TOKEN) return;
 
+    // Check khoảng cách di chuyển để hạn chế gọi API
     if (lastRouteFetchPos.current) {
         const dist = getDistanceInMeters(start.lat, start.lng, lastRouteFetchPos.current.lat, lastRouteFetchPos.current.lng);
         if (dist < REFRESH_DISTANCE) return; 
     }
     
+    // Throttle 2s
     const now = Date.now();
     if (now - lastApiCall.current < 2000) return;
     lastApiCall.current = now;
@@ -102,47 +143,63 @@ export default function MapView() {
     }
   }, []);
 
-  // --- 2. SIGNALR (Kết nối 1 lần duy nhất) ---
+  // --- 3. VẼ ĐƯỜNG ---
+  useEffect(() => {
+    if (gpsStarted && myPos && targetUser) {
+        fetchORSDirections(myPos, { lat: targetUser.lat, lng: targetUser.lng });
+    } else {
+        // Nếu không có target thì xóa đường
+        setRoutePath([]);
+        setRouteInfo(null);
+    }
+  }, [myPos, targetUser, gpsStarted, fetchORSDirections]);
+
+
+  // --- 4. SIGNALR (MULTI-USER LOGIC) ---
   useEffect(() => {
     const apiUrl = import.meta.env.VITE_API_URL;
     const conn = new signalR.HubConnectionBuilder()
       .withUrl(`${apiUrl}/mapHub`)
-      .withAutomaticReconnect() // Tự động kết nối lại nếu rớt mạng
+      .withAutomaticReconnect()
       .build();
 
     conn.start().then(() => {
-      console.log("✅ Đã kết nối SignalR thành công!");
+      console.log("✅ SignalR Connected (Multi-User Mode)");
 
-      conn.on("RescuerMoved", (lat, lng) => { 
-        console.log("📩 Nhận tin: Rescuer đang ở", lat, lng);
-        // Kiểm tra Role hiện tại trong Ref
-        if (roleRef.current === "PATIENT") {
-            setOtherPos({ lat, lng }); 
-        }
+      // 4.1. Nhận danh sách toàn bộ user khi mới vào
+      conn.on("UpdateAllUsers", (users: UserLocation[]) => {
+        console.log("📥 Nhận danh sách user:", users);
+        const userMap: Record<string, UserLocation> = {};
+        users.forEach(u => userMap[u.connectionId] = u);
+        setOtherUsers(userMap);
       });
 
-      conn.on("PatientMoved", (lat, lng) => { 
-        console.log("📩 Nhận tin: Patient đang ở", lat, lng);
-        if (roleRef.current === "RESCUER") {
-            setOtherPos({ lat, lng }); 
-        }
+      // 4.2. Nhận tin 1 user di chuyển
+      conn.on("UserMoved", (user: UserLocation) => {
+        // console.log("User di chuyển:", user);
+        setOtherUsers(prev => ({
+            ...prev,
+            [user.connectionId]: user
+        }));
       });
-    }).catch(err => console.error("❌ Lỗi kết nối SignalR:", err));
+
+      // 4.3. Nhận tin user thoát
+      conn.on("UserLeft", (connectionId: string) => {
+        console.log("User đã thoát:", connectionId);
+        setOtherUsers(prev => {
+            const newState = { ...prev };
+            delete newState[connectionId];
+            return newState;
+        });
+      });
+
+    }).catch(err => console.error("SignalR Error:", err));
 
     connectionRef.current = conn;
-    
-    // Cleanup
     return () => { conn.stop(); };
-  }, []); // Chỉ chạy 1 lần khi load trang
+  }, []); 
 
-  // --- 3. LOGIC VẼ ĐƯỜNG ---
-  useEffect(() => {
-    if (gpsStarted && myPos && otherPos) {
-        fetchORSDirections(myPos, otherPos);
-    }
-  }, [myPos, otherPos, gpsStarted, fetchORSDirections]);
-
-  // --- 4. MAP DRAG & RECENTER ---
+  // --- 5. MAP HANDLERS ---
   const handleMapDragStart = () => {
     isAutoCenterRef.current = false;
     setShowRecenterBtn(true);
@@ -157,7 +214,7 @@ export default function MapView() {
     }
   };
 
-  // --- 5. GPS ---
+  // --- 6. GPS ---
   const startGps = () => {
     if (!navigator.geolocation) return alert("Không hỗ trợ GPS");
     setGpsStarted(true);
@@ -170,24 +227,19 @@ export default function MapView() {
         const newPos = { lat, lng };
         setMyPos(newPos);
 
-        // Auto center map nếu chưa kéo đi chỗ khác
         if (isAutoCenterRef.current && mapRef.current) {
             mapRef.current.panTo(newPos);
         }
 
-        // Gửi vị trí lên server (Throttle 2s)
         const now = Date.now();
         if (now - lastSentRef.current > 2000 && connectionRef.current?.state === signalR.HubConnectionState.Connected) {
-            
-            // Log để debug xem có gửi đi không
-            console.log(`📤 Đang gửi vị trí của ${roleRef.current}:`, lat, lng);
-            
-            const method = roleRef.current === "PATIENT" ? "SendPatientLocation" : "SendRescuerLocation";
-            connectionRef.current.invoke(method, lat, lng).catch(console.error);
+            // 🔥 GỌI HÀM BE MỚI: SendLocation(role, lat, lng)
+            const currentRole = roleRef.current; // Lấy role từ ref
+            connectionRef.current.invoke("SendLocation", currentRole, lat, lng).catch(console.error);
             lastSentRef.current = now;
         }
       },
-      (err) => console.error("Lỗi GPS:", err),
+      (err) => console.error(err),
       { enableHighAccuracy: true, timeout: 5000, maximumAge: 0 }
     );
   };
@@ -203,8 +255,8 @@ export default function MapView() {
           <button onClick={handleRecenter} style={{ position: "absolute", zIndex: 50, bottom: 120, right: 20, background: "white", border: "none", borderRadius: "50%", width: "50px", height: "50px", boxShadow: "0 2px 6px rgba(0,0,0,0.3)", fontSize: "24px", cursor: "pointer", display:"flex", alignItems:"center", justifyContent:"center" }}>🎯</button>
       )}
 
-      {/* INFO BOX */}
-      {routeInfo && gpsStarted && otherPos && routePath.length > 0 && (
+      {/* INFO BOX (Chỉ hiện khi có target) */}
+      {routeInfo && gpsStarted && targetUser && routePath.length > 0 && (
         <div style={{ position: "absolute", zIndex: 20, top: 10, left: 10, right: 10, background: "white", padding: "12px", borderRadius: "10px", boxShadow: "0 4px 12px rgba(0,0,0,0.15)", display: "flex", justifyContent: "space-between" }}>
           <div><small style={{color:"#666"}}>Khoảng cách</small><div style={{fontWeight:"bold", color:"#2563eb", fontSize:"18px"}}>{routeInfo.distance}</div></div>
           <div style={{width:1, background:"#ddd"}}></div>
@@ -225,26 +277,37 @@ export default function MapView() {
       )}
 
       <GoogleMap 
-        mapContainerStyle={CONTAINER_STYLE} 
-        center={DEFAULT_CENTER} 
-        zoom={15} 
+        mapContainerStyle={CONTAINER_STYLE} center={DEFAULT_CENTER} zoom={15} 
         onLoad={(map) => { mapRef.current = map; }}
         onDragStart={handleMapDragStart} 
         options={{ disableDefaultUI: true, zoomControl: true }}
       >
+        {/* Marker của Tôi */}
         {gpsStarted && <Marker position={myPos} label={{ text: "Me", color: "white" }} icon={role === "PATIENT" ? ICON_RED : ICON_BLUE} zIndex={100}/>}
         
-        {/* Render Marker đối phương */}
-        {otherPos && (
-             <Marker 
-                position={otherPos} 
-                icon={role === "PATIENT" ? ICON_BLUE : ICON_RED} 
-                zIndex={90}
-            />
-        )}
+        {/* 🔥 RENDER NHIỀU MARKER NGƯỜI KHÁC */}
+        {Object.values(otherUsers).map((user) => {
+            // Logic lọc: Nếu mình là Patient thì chỉ hiện Rescuer, và ngược lại
+            // Ở đây tôi để hiện tất cả nhưng khác màu để dễ test
+            const isOpposite = (role === "PATIENT" && user.role === "RESCUER") || (role === "RESCUER" && user.role === "PATIENT");
+            
+            // Chỉ hiện những người đối lập (hoặc bỏ if này để hiện tất cả)
+            if (isOpposite) {
+                return (
+                    <Marker 
+                        key={user.connectionId}
+                        position={{ lat: user.lat, lng: user.lng }}
+                        icon={user.role === "PATIENT" ? ICON_RED : ICON_BLUE}
+                        label={{ text: user.role[0], color: "white" }} // P hoặc R
+                        zIndex={90}
+                    />
+                );
+            }
+            return null;
+        })}
 
-        {/* Render Đường đi */}
-        {gpsStarted && otherPos && routePath.length > 0 && (
+        {/* Vẽ đường tới mục tiêu gần nhất */}
+        {gpsStarted && targetUser && routePath.length > 0 && (
             <Polyline
                 path={routePath} 
                 options={{
