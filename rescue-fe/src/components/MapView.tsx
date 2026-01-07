@@ -1,38 +1,96 @@
-import { useEffect, useRef, useState } from "react";
-import { GoogleMap, Marker, useJsApiLoader } from "@react-google-maps/api";
+import { useEffect, useRef, useState, useCallback } from "react";
+import { GoogleMap, Marker, useJsApiLoader, DirectionsRenderer } from "@react-google-maps/api";
 import * as signalR from "@microsoft/signalr";
 
-const containerStyle = {
-  width: "100vw",
-  height: "100vh",
-};
+// --- CẤU HÌNH ---
+const CONTAINER_STYLE = { width: "100vw", height: "100vh" };
+const DEFAULT_CENTER = { lat: 21.0285, lng: 105.8542 };
+const REFRESH_THRESHOLD_METERS = 50; // Chỉ vẽ lại đường nếu di chuyển quá 50m
 
-const defaultCenter = {
-  lat: 21.0285,
-  lng: 105.8542,
-};
-
-// Định nghĩa kiểu Role
 type Role = "PATIENT" | "RESCUER";
 
-export default function MapView() {
-  const [center, setCenter] = useState(defaultCenter);
-  
-  // Vị trí của đối phương (nhận từ Server)
-  const [otherPos, setOtherPos] = useState<{ lat: number; lng: number } | null>(null);
-  
-  // Trạng thái GPS và Role
-  const [gpsStarted, setGpsStarted] = useState(false);
-  const [role, setRole] = useState<Role>("PATIENT"); // Mặc định là Patient
+// Hàm tính khoảng cách giữa 2 tọa độ (Haversine Formula) - Đơn vị: Mét
+const getDistanceInMeters = (lat1: number, lng1: number, lat2: number, lng2: number) => {
+  const R = 6371e3; // Bán kính trái đất (mét)
+  const φ1 = (lat1 * Math.PI) / 180;
+  const φ2 = (lat2 * Math.PI) / 180;
+  const Δφ = ((lat2 - lat1) * Math.PI) / 180;
+  const Δλ = ((lng2 - lng1) * Math.PI) / 180;
 
+  const a = Math.sin(Δφ / 2) * Math.sin(Δφ / 2) +
+            Math.cos(φ1) * Math.cos(φ2) *
+            Math.sin(Δλ / 2) * Math.sin(Δλ / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+
+  return R * c;
+};
+
+export default function MapView() {
+  // --- STATE ---
+  const [center, setCenter] = useState(DEFAULT_CENTER);
+  const [otherPos, setOtherPos] = useState<{ lat: number; lng: number } | null>(null);
+  const [role, setRole] = useState<Role>("PATIENT");
+  const [gpsStarted, setGpsStarted] = useState(false);
+  const [routeInfo, setRouteInfo] = useState<{ distance: string; duration: string } | null>(null);
+  const [directionsResponse, setDirectionsResponse] = useState<google.maps.DirectionsResult | null>(null);
+
+  // --- REFS (Lưu trạng thái không gây render lại) ---
   const connectionRef = useRef<signalR.HubConnection | null>(null);
   const lastSentRef = useRef<number>(0);
+  
+  // Lưu tọa độ của lần gọi API chỉ đường gần nhất để so sánh
+  const lastRouteCoords = useRef<{
+      origin: { lat: number; lng: number } | null,
+      dest: { lat: number; lng: number } | null
+  }>({ origin: null, dest: null });
 
   const { isLoaded, loadError } = useJsApiLoader({
     googleMapsApiKey: import.meta.env.VITE_GOOGLE_MAPS_KEY,
   });
 
-  // 1️⃣ Kết nối SignalR và Lắng nghe sự kiện
+  // --- 1. HÀM GỌI GOOGLE DIRECTIONS API (Đã tối ưu) ---
+  const fetchDirections = useCallback((origin: { lat: number, lng: number }, destination: { lat: number, lng: number }) => {
+    if (!window.google) return;
+
+    // Kiểm tra logic tối ưu:
+    if (lastRouteCoords.current.origin && lastRouteCoords.current.dest) {
+        const distMovedOrigin = getDistanceInMeters(origin.lat, origin.lng, lastRouteCoords.current.origin.lat, lastRouteCoords.current.origin.lng);
+        const distMovedDest = getDistanceInMeters(destination.lat, destination.lng, lastRouteCoords.current.dest.lat, lastRouteCoords.current.dest.lng);
+
+        // Nếu cả mình và đối phương đều chưa di chuyển quá 50m so với lần vẽ trước -> KHÔNG GỌI API
+        if (distMovedOrigin < REFRESH_THRESHOLD_METERS && distMovedDest < REFRESH_THRESHOLD_METERS) {
+            return; 
+        }
+    }
+
+    // Nếu thỏa mãn điều kiện -> Gọi API
+    const service = new window.google.maps.DirectionsService();
+    service.route(
+      {
+        origin: origin,
+        destination: destination,
+        travelMode: window.google.maps.TravelMode.DRIVING,
+      },
+      (result, status) => {
+        if (status === "OK" && result) {
+          setDirectionsResponse(result);
+          const leg = result.routes[0].legs[0];
+          setRouteInfo({
+            distance: leg.distance?.text || "",
+            duration: leg.duration?.text || "",
+          });
+          
+          // Cập nhật lại mốc tọa độ vừa vẽ
+          lastRouteCoords.current = { origin, dest: destination };
+          console.log("📍 Đã cập nhật đường đi mới từ Google API");
+        } else {
+          console.error("Directions error:", status);
+        }
+      }
+    );
+  }, []);
+
+  // --- 2. SIGNALR SETUP ---
   useEffect(() => {
     const apiUrl = import.meta.env.VITE_API_URL;
     const conn = new signalR.HubConnectionBuilder()
@@ -42,70 +100,42 @@ export default function MapView() {
 
     conn.start().then(() => {
       console.log("SignalR Connected");
-
-      // Lắng nghe cả 2 sự kiện (nhưng chỉ cập nhật UI dựa trên role)
-      
-      // Nếu có Rescuer di chuyển
       conn.on("RescuerMoved", (lat, lng) => {
-        // Nếu mình là Patient -> Thì Rescuer là "người kia"
-        setRole((currentRole) => {
-            if (currentRole === "PATIENT") {
-                setOtherPos({ lat, lng });
-            }
-            return currentRole;
-        });
+        setRole((cur) => cur === "PATIENT" ? (setOtherPos({ lat, lng }), cur) : cur);
       });
-
-      // Nếu có Patient di chuyển
       conn.on("PatientMoved", (lat, lng) => {
-        // Nếu mình là Rescuer -> Thì Patient là "người kia"
-        setRole((currentRole) => {
-            if (currentRole === "RESCUER") {
-                setOtherPos({ lat, lng });
-            }
-            return currentRole;
-        });
+        setRole((cur) => cur === "RESCUER" ? (setOtherPos({ lat, lng }), cur) : cur);
       });
-
     });
 
     connectionRef.current = conn;
     return () => { conn.stop(); };
   }, []);
 
-  // Reset vị trí đối phương khi đổi vai trò
+  // --- 3. TRIGGER VẼ ĐƯỜNG ---
+  // Mỗi khi center hoặc otherPos thay đổi, hàm này chạy, nhưng API chỉ gọi nếu vượt ngưỡng
   useEffect(() => {
-    setOtherPos(null);
-  }, [role]);
-
-  // 2️⃣ Gửi vị trí (Theo Role)
-  const sendLocationUpdate = (lat: number, lng: number) => {
-    const now = Date.now();
-    // Throttle 2s
-    if (now - lastSentRef.current > 2000 && connectionRef.current?.state === signalR.HubConnectionState.Connected) {
-      
-      if (role === "PATIENT") {
-        // Mình là nạn nhân -> Gửi tin "Tôi là nạn nhân đây"
-        connectionRef.current.invoke("SendPatientLocation", lat, lng);
-      } else {
-        // Mình là cứu hộ -> Gửi tin "Tôi là cứu hộ đây"
-        connectionRef.current.invoke("SendRescuerLocation", lat, lng);
-      }
-      
-      lastSentRef.current = now;
+    if (gpsStarted && center && otherPos) {
+        fetchDirections(center, otherPos);
     }
-  };
+  }, [center, otherPos, gpsStarted, fetchDirections]);
 
-  // 3️⃣ Start GPS
+  // --- 4. GPS & GỬI VỊ TRÍ ---
   const startGps = () => {
     if (!navigator.geolocation) return alert("Không hỗ trợ GPS");
     setGpsStarted(true);
-
     navigator.geolocation.watchPosition(
       (pos) => {
         const { latitude: lat, longitude: lng } = pos.coords;
         setCenter({ lat, lng });
-        sendLocationUpdate(lat, lng);
+
+        // Throttle gửi SignalR (2 giây/lần)
+        const now = Date.now();
+        if (now - lastSentRef.current > 2000 && connectionRef.current?.state === signalR.HubConnectionState.Connected) {
+            const method = role === "PATIENT" ? "SendPatientLocation" : "SendRescuerLocation";
+            connectionRef.current.invoke(method, lat, lng).catch(console.error);
+            lastSentRef.current = now;
+        }
       },
       (err) => console.error(err),
       { enableHighAccuracy: true, timeout: 10000 }
@@ -117,72 +147,50 @@ export default function MapView() {
 
   return (
     <div style={{ position: "relative" }}>
-      {/* UI Chọn Role & Bắt đầu */}
-      {!gpsStarted && (
+      {/* INFO BOX */}
+      {routeInfo && gpsStarted && otherPos && (
         <div style={{
-            position: "absolute", zIndex: 10, top: 20, left: "50%", transform: "translateX(-50%)",
-            background: "white", padding: 20, borderRadius: 8, boxShadow: "0 2px 10px rgba(0,0,0,0.3)",
-            display: "flex", flexDirection: "column", gap: 10, alignItems: "center"
+          position: "absolute", zIndex: 20, top: 10, left: 10, right: 10,
+          background: "white", padding: "12px", borderRadius: "10px",
+          boxShadow: "0 4px 12px rgba(0,0,0,0.15)", display: "flex", justifyContent: "space-between"
         }}>
-            <h3 style={{margin: 0}}>Chọn vai trò của bạn</h3>
-            
-            <div style={{display: "flex", gap: 10}}>
-                <button 
-                    onClick={() => setRole("PATIENT")}
-                    style={{
-                        padding: "10px", background: role === "PATIENT" ? "red" : "#ccc", 
-                        color: "white", border: "none", borderRadius: 4, cursor: "pointer"
-                    }}
-                >
-                    🚑 Người bị nạn (Patient)
-                </button>
-                <button 
-                    onClick={() => setRole("RESCUER")}
-                    style={{
-                        padding: "10px", background: role === "RESCUER" ? "blue" : "#ccc", 
-                        color: "white", border: "none", borderRadius: 4, cursor: "pointer"
-                    }}
-                >
-                    👮 Người cứu hộ (Rescuer)
-                </button>
-            </div>
-
-            <button
-                onClick={startGps}
-                style={{
-                    width: "100%", padding: "12px", background: "#22c55e", 
-                    color: "white", border: "none", borderRadius: 4, fontWeight: "bold", cursor: "pointer"
-                }}
-            >
-                📍 BẮT ĐẦU TRACKING
-            </button>
+          <div><small style={{color:"#666"}}>Khoảng cách</small><div style={{fontWeight:"bold", color:"#2563eb"}}>{routeInfo.distance}</div></div>
+          <div style={{width:1, background:"#ddd"}}></div>
+          <div><small style={{color:"#666"}}>Thời gian</small><div style={{fontWeight:"bold", color:"#2563eb"}}>{routeInfo.duration}</div></div>
         </div>
       )}
 
-      {/* Bản đồ */}
-      <GoogleMap mapContainerStyle={containerStyle} center={center} zoom={15}>
+      {/* ROLE SELECTION */}
+      {!gpsStarted && (
+        <div style={{
+            position: "absolute", zIndex: 10, top: "40%", left: "50%", transform: "translate(-50%, -50%)",
+            background: "white", padding: 20, borderRadius: 12, boxShadow: "0 4px 20px rgba(0,0,0,0.2)",
+            textAlign: "center", width: "80%", maxWidth: "300px"
+        }}>
+            <h3 style={{marginBottom: 15}}>Chọn vai trò</h3>
+            <div style={{display: "flex", gap: 10, marginBottom: 15}}>
+                <button onClick={() => setRole("PATIENT")} style={{flex: 1, padding: 10, background: role === "PATIENT" ? "#ef4444" : "#f3f4f6", color: role==="PATIENT"?"white":"black", border: "none", borderRadius: 6}}>Patient</button>
+                <button onClick={() => setRole("RESCUER")} style={{flex: 1, padding: 10, background: role === "RESCUER" ? "#3b82f6" : "#f3f4f6", color: role==="RESCUER"?"white":"black", border: "none", borderRadius: 6}}>Rescuer</button>
+            </div>
+            <button onClick={startGps} style={{width: "100%", padding: 12, background: "black", color: "white", borderRadius: 6, fontWeight: "bold"}}>BẮT ĐẦU</button>
+        </div>
+      )}
+
+      <GoogleMap mapContainerStyle={CONTAINER_STYLE} center={center} zoom={15} options={{ disableDefaultUI: true, zoomControl: true }}>
+        {/* Marker luôn update realtime */}
+        {gpsStarted && <Marker position={center} label="Me" zIndex={2} icon={role === "PATIENT" ? "http://maps.google.com/mapfiles/ms/icons/red-dot.png" : "http://maps.google.com/mapfiles/ms/icons/blue-dot.png"} />}
         
-        {/* 1. Vị trí của CHÍNH MÌNH (Luôn lấy từ GPS) */}
-        {gpsStarted && (
-            <Marker 
-                position={center} 
-                label={{ text: "Me", color: "white" }}
-                icon={role === "PATIENT" 
-                    ? "http://maps.google.com/mapfiles/ms/icons/red-dot.png" // Icon đỏ nếu mình là nạn nhân
-                    : "http://maps.google.com/mapfiles/ms/icons/blue-dot.png" // Icon xanh nếu mình là cứu hộ
-                }
-            />
+        {otherPos && (
+             <Marker position={otherPos} label="Target" zIndex={2} icon={role === "PATIENT" ? "http://maps.google.com/mapfiles/ms/icons/blue-dot.png" : "http://maps.google.com/mapfiles/ms/icons/red-dot.png"} />
         )}
 
-        {/* 2. Vị trí của ĐỐI PHƯƠNG (Nhận từ SignalR) */}
-        {otherPos && (
-            <Marker 
-                position={otherPos} 
-                label={{ text: role === "PATIENT" ? "Rescuer" : "Patient", color: "black", fontWeight: "bold" }}
-                icon={role === "PATIENT" 
-                    ? "http://maps.google.com/mapfiles/ms/icons/blue-dot.png" // Đối phương là cứu hộ (xanh)
-                    : "http://maps.google.com/mapfiles/ms/icons/red-dot.png"  // Đối phương là nạn nhân (đỏ)
-                }
+        {directionsResponse && (
+            <DirectionsRenderer 
+                directions={directionsResponse}
+                options={{
+                    suppressMarkers: true, // Tắt marker mặc định của đường đi để dùng Marker realtime của mình
+                    polylineOptions: { strokeColor: role === "PATIENT" ? "#ef4444" : "#3b82f6", strokeWeight: 5 }
+                }} 
             />
         )}
       </GoogleMap>
