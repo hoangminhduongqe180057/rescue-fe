@@ -10,14 +10,13 @@ const DEFAULT_CENTER = { lat: 21.0285, lng: 105.8542 };
 const ICON_RED = "https://maps.google.com/mapfiles/ms/icons/red-dot.png";
 const ICON_BLUE = "https://maps.google.com/mapfiles/ms/icons/blue-dot.png";
 
-// Lấy Token từ .env
+// Lấy Token
 const ORS_TOKEN = import.meta.env.VITE_ORS_TOKEN;
-
-// Di chuyển 10m là vẽ lại đường ngay
-const REFRESH_DISTANCE = 10; 
+const REFRESH_DISTANCE = 10; // 10 mét vẽ lại đường
 
 type Role = "PATIENT" | "RESCUER";
 
+// --- HELPER FUNCTIONS ---
 const formatRouteInfo = (meters: number, seconds: number) => {
     let distanceStr = meters < 1000 ? `${Math.round(meters)} m` : `${(meters / 1000).toFixed(1)} km`;
     let durationStr = seconds < 60 ? `${Math.round(seconds)} giây` : `${Math.round(seconds / 60)} phút`;
@@ -40,33 +39,29 @@ export default function MapView() {
   const [otherPos, setOtherPos] = useState<{ lat: number; lng: number } | null>(null);
   const [role, setRole] = useState<Role>("PATIENT");
   const [gpsStarted, setGpsStarted] = useState(false);
+  
+  // UI Re-center
   const [showRecenterBtn, setShowRecenterBtn] = useState(false);
 
   // Info đường đi & Path
   const [routeInfo, setRouteInfo] = useState<{ distance: string; duration: string } | null>(null);
   const [routePath, setRoutePath] = useState<{lat: number, lng: number}[]>([]);
 
-  // --- REFS QUAN TRỌNG ---
+  // Refs
   const mapRef = useRef<google.maps.Map | null>(null);
   const connectionRef = useRef<signalR.HubConnection | null>(null);
-  const isAutoCenterRef = useRef(true); 
   const lastSentRef = useRef<number>(0);
   const lastApiCall = useRef<number>(0);
   const lastRouteFetchPos = useRef<{ lat: number, lng: number } | null>(null);
   
-  // 🔥 FIX QUAN TRỌNG: Lưu role vào Ref để SignalR đọc được giá trị mới nhất mà không cần reconnect
-  const roleRef = useRef<Role>("PATIENT");
+  // 🔥 FIX GIẬT MAP: Dùng Ref để lưu trạng thái AutoCenter (Logic mới)
+  const isAutoCenterRef = useRef(true); 
 
   const { isLoaded, loadError } = useJsApiLoader({
     googleMapsApiKey: import.meta.env.VITE_GOOGLE_MAPS_KEY,
   });
 
-  // Cập nhật roleRef mỗi khi state role đổi
-  useEffect(() => {
-    roleRef.current = role;
-  }, [role]);
-
-  // --- HÀM GỌI API (ORS) ---
+  // --- HÀM GỌI API ORS (Logic mới: đã tối ưu throttle) ---
   const fetchORSDirections = useCallback(async (start: { lat: number; lng: number }, end: { lat: number; lng: number }) => {
     if (!ORS_TOKEN) return;
 
@@ -102,7 +97,8 @@ export default function MapView() {
     }
   }, []);
 
-  // --- SIGNALR (FIXED: Chỉ connect 1 lần duy nhất) ---
+  // --- SIGNALR (Dùng Logic CŨ: Reconnect khi đổi Role) ---
+  // Lý do: Để kích hoạt OnConnectedAsync ở Backend -> Lấy được vị trí người kia ngay lập tức
   useEffect(() => {
     const apiUrl = import.meta.env.VITE_API_URL;
     const conn = new signalR.HubConnectionBuilder()
@@ -111,27 +107,32 @@ export default function MapView() {
       .build();
 
     conn.start().then(() => {
-      console.log("✅ SignalR Connected");
+      console.log(`✅ SignalR Connected as ${role}`);
       
-      // Sử dụng roleRef.current thay vì role state
+      // Xóa vị trí cũ để tránh hiển thị sai
+      setOtherPos(null);
+      setRoutePath([]);
+      setRouteInfo(null);
+
+      // Lắng nghe sự kiện
       conn.on("RescuerMoved", (lat, lng) => { 
-        if (roleRef.current === "PATIENT") {
-            console.log("Nhận vị trí Rescuer:", lat, lng);
+        if (role === "PATIENT") {
             setOtherPos({ lat, lng }); 
         }
       });
-      
+
       conn.on("PatientMoved", (lat, lng) => { 
-        if (roleRef.current === "RESCUER") {
-            console.log("Nhận vị trí Patient:", lat, lng);
+        if (role === "RESCUER") {
             setOtherPos({ lat, lng }); 
         }
       });
     });
 
     connectionRef.current = conn;
+    
+    // Cleanup: Ngắt kết nối khi đổi role
     return () => { conn.stop(); };
-  }, []); // Dependency rỗng -> Chỉ chạy 1 lần khi Mount
+  }, [role]); // 🔥 Dependency [role] quan trọng để lấy data lần đầu
 
   // --- TỰ ĐỘNG VẼ ĐƯỜNG ---
   useEffect(() => {
@@ -140,14 +141,14 @@ export default function MapView() {
     }
   }, [myPos, otherPos, gpsStarted, fetchORSDirections]);
 
-  // --- MAP HANDLERS ---
+  // --- MAP HANDLERS (Logic mới: Fix giật map) ---
   const handleMapDragStart = () => {
-    isAutoCenterRef.current = false;
+    isAutoCenterRef.current = false; // Tắt auto center ngay khi kéo
     setShowRecenterBtn(true);
   };
 
   const handleRecenter = () => {
-    isAutoCenterRef.current = true;
+    isAutoCenterRef.current = true; // Bật lại auto center
     setShowRecenterBtn(false);
     if (mapRef.current) {
         mapRef.current.panTo(myPos);
@@ -155,7 +156,7 @@ export default function MapView() {
     }
   };
 
-  // --- GPS ---
+  // --- GPS (Logic mới: Fix giật map bằng Ref) ---
   const startGps = () => {
     if (!navigator.geolocation) return alert("Không hỗ trợ GPS");
     setGpsStarted(true);
@@ -168,14 +169,14 @@ export default function MapView() {
         const newPos = { lat, lng };
         setMyPos(newPos);
 
+        // 🔥 CHECK REF thay vì State để tránh giật map
         if (isAutoCenterRef.current && mapRef.current) {
             mapRef.current.panTo(newPos);
         }
 
         const now = Date.now();
         if (now - lastSentRef.current > 2000 && connectionRef.current?.state === signalR.HubConnectionState.Connected) {
-            // Dùng roleRef ở đây cũng an toàn hơn
-            const method = roleRef.current === "PATIENT" ? "SendPatientLocation" : "SendRescuerLocation";
+            const method = role === "PATIENT" ? "SendPatientLocation" : "SendRescuerLocation";
             connectionRef.current.invoke(method, lat, lng).catch(console.error);
             lastSentRef.current = now;
         }
@@ -222,21 +223,20 @@ export default function MapView() {
         center={DEFAULT_CENTER} 
         zoom={15} 
         onLoad={(map) => { mapRef.current = map; }}
+        // 🔥 Sự kiện này giúp tắt AutoCenter khi user kéo map
         onDragStart={handleMapDragStart} 
         options={{ disableDefaultUI: true, zoomControl: true }}
       >
         {gpsStarted && <Marker position={myPos} label={{ text: "Me", color: "white" }} icon={role === "PATIENT" ? ICON_RED : ICON_BLUE} zIndex={100}/>}
         
-        {/* Render Marker của OtherPos */}
         {otherPos && (
-             <Marker 
+            <Marker 
                 position={otherPos} 
                 icon={role === "PATIENT" ? ICON_BLUE : ICON_RED} 
                 zIndex={90}
             />
         )}
 
-        {/* VẼ ĐƯỜNG ĐI */}
         {gpsStarted && otherPos && routePath.length > 0 && (
             <Polyline
                 path={routePath} 
